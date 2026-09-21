@@ -1,7 +1,8 @@
 # 00 — Agent runner: architecture and feasibility (discussion draft)
 
-- Status: draft v0, 2026-09-16
+- Status: draft v1, 2026-09-20
 - Source: [decision summary (sanitized)](../research/2026-09-16-runner-decision-summary.md)
+- Companion: [logical VFS and runtime gates](01-logical-vfs-and-runtime-gates.md)
 - Project name: `agentd` (provisional, see §3)
 
 ## 1. Problem
@@ -31,7 +32,10 @@ That gap is what this runner covers.
   workspaces** and **bounded JS executions**.
 - An execution sandbox on **celld** (Dynamic Workers), deployed in normal pods.
 - **Durable state in PostgreSQL**: workspaces, datasets/artifacts (references and versions),
-  executions and their attempts, permissions. Bytes in an **S3-compatible bucket**.
+  executions and their attempts, permissions. Bytes in an **S3-compatible application bucket**.
+- A **logical VFS (catalog)** in the runner: path-like names → immutable versions → `blob_key`,
+  plus summaries and ACLs. The sandbox sees a filesystem-*like* capability facade; there is no
+  POSIX or mountable filesystem in celld.
 - **Execution idempotency**: the `executionId` survives Flue retries; if celld finished but the
   response was lost, the runner returns the already-recorded result.
 - **Flue-first integration**, with a tool surface (`execute_js` and related) that the agent host
@@ -45,11 +49,15 @@ That gap is what this runner covers.
 ### Non-goals (for now)
 
 - Python, native packages, or a Linux shell inside the sandbox. JavaScript only.
+- A **POSIX / mountable FS** inside the sandbox or as a second source of truth (no inodes,
+  partial-write journals, or chunked block stores).
 - Hostile multi-tenant code isolation as the primary guarantee. celld is declared alpha and not
   safe for hostile code; the end user is internal and code goes through capability controls, pod
   limits, and result review.
 - Replacing Flue: the runner does **not** store conversation history or agent decisions.
 - Using celld’s Containers modality (requires Docker/Podman and privileged networking).
+- Using celld Workflows, Queues, KV, or D1 as **system of record** (they would create a second
+  truth in the fleet bucket and pin the executor).
 - Building a custom JS runtime or modifying celld’s Rust engine.
 - Large joins against external analytical stores: those stay on the agent host with its
   credentials; the sandbox combines files and bounded results.
@@ -74,17 +82,47 @@ document uses "runner" as a neutral term.
 - Persistence and coordination backed by a bucket (`CELLD_DURABILITY=bucket` waits for the bucket
   write before confirming). S3 is among the supported providers.
 - Capability model: outbound network can be blocked (`globalOutbound: null`) and specific
-  capabilities exposed to dynamic code.
-- Maintained under `denoland`, Apache-2.0, active releases (v0.5.0 on 2026-09-15).
+  capabilities exposed to dynamic code via `env` stubs / `props` (sandbox never sees props).
+- Durable Object Facets (`abort` as a cancellation lever to verify) and DO alarms as rebuildable
+  watchdogs.
+- Maintained under `denoland`, Apache-2.0, active releases (**v0.5.1** as of 2026-09-19).
 
 ### What it does not provide (and the runner must cover or verify)
 
-- Dynamic Workers **do not enforce** the `cpuMs` and `subRequests` limits from their API. A
-  `while (true)` or a huge memory allocation is contained only by pod limits, which are global to
-  the process.
-- Effective cancellation of an in-flight execution: still to be demonstrated.
+- **Filesystem mounts:** `node:fs` exposes only a request-local empty `/tmp` and read-only
+  `/bundle`. There is no mount API. Any path-like surface the agent sees is a **loader-side
+  facade** over the runner catalog, by construction.
+- **CPU / subrequest limits:** v0.5.1 release notes claim Dynamic Workers can enforce `cpuMs` /
+  `subRequests` via `WorkerCode.limits` or `getEntrypoint()`. Compat docs may still say limits
+  are rejected — **verify on the pinned binary** before trusting them. Until verified,
+  containment still relies on V8 heap limits, pod limits, and a runner watchdog.
+- Effective cancellation of an in-flight execution: still to be demonstrated (Facet `abort`,
+  stub drop, `/evict`, process restart as last resort).
 - Isolation for hostile code: declared out of scope by the project.
 - Security patches only for the latest version: requires staying close to releases.
+- Process ceilings to respect: ~256 live Dynamic Workers per process; `env` / `props` ≤ 1 MiB;
+  per-isolate V8 heap default ~128 MB (`CELLD_V8_HEAP_LIMIT_MB`, process-wide).
+
+### Ownership and two-bucket topology
+
+| Store | Owner | Role |
+|---|---|---|
+| PostgreSQL (catalog, executions, permissions) | **runner** | Sole durable truth |
+| Application bucket (whole objects) | **runner** | Bytes; ranged GET / multipart PUT |
+| celld fleet bucket | **celld only** | Fleet durability; reserved prefixes; never app data |
+| celld DO SQLite / Facets | celld (rebuildable) | In-flight cache / scratch only |
+
+- **Two buckets:** fleet credentials stay with celld; app credentials stay with the runner (or
+  short-lived signed URLs passed in loader `props`). Do not bind the celld R2 fleet bucket for
+  application bytes. Cross-deny must be tested.
+- **Auth runner ↔ celld:** the celld **public** app listener authenticates the runner (short-lived
+  token scoping workspace / execution / attempt / expiry). Callbacks to the runner are also
+  authenticated. The **operator** listener (`/state`, `/evict`, …) stays on the private pod
+  network with no public ingress.
+
+Design rule: **celld orchestrates, Postgres remembers**. celld’s own durability keeps its
+internal state across restarts, but the runner does not depend on it to recover a task. That
+keeps the executor swappable.
 
 ### Responsibility split
 
@@ -94,16 +132,16 @@ document uses "runner" as a neutral term.
 └────────────┬─────────────┘
              │ SDK (TS) + Flue adapter
 ┌────────────▼─────────────┐      ┌──────────────┐
-│ runner (control plane)   │─────▶│ PostgreSQL   │ workspaces, datasets, artifacts, executions
-│ API, idempotency,        │      └──────────────┘
-│ permissions, retries     │─────▶┌──────────────┐
-└────────────┬─────────────┘      │ Bucket       │ bytes: CSV, JSON, XLSX, images, results
-             │ HTTP               └──────▲───────┘
+│ runner (control plane)   │─────▶│ PostgreSQL   │ catalog, versions, executions, attempts
+│ API, catalog, blob API,  │      └──────────────┘
+│ reconciler, publish      │─────▶┌──────────────┐
+└────────────┬─────────────┘      │ App bucket   │ whole objects (identity keys)
+             │ authenticated HTTP └──────▲───────┘
 ┌────────────▼─────────────┐             │
-│ celld app (Worker + DO)  │─────────────┘  (celld’s own data, bucket durability)
+│ celld app (Worker + DO)  │── facade ───┘  (streams via loader capabilities)
 │  ┌────────────────────┐  │
-│  │ Dynamic Worker     │  │ agent JS; explicit capabilities: readDataset,
-│  │ (one execution)    │──┼──▶ saveArtifact, callTool (via host gateway, read-only at first)
+│  │ Dynamic Worker     │  │ agent JS; WS.read / rows / readRange / write / list / tool
+│  │ (one execution)    │──┼──▶ rebuildable orchestration only
 │  └────────────────────┘  │
 └──────────────────────────┘
 ```
@@ -111,39 +149,69 @@ document uses "runner" as a neutral term.
 | Component | Keeps or runs |
 |---|---|
 | Flue | History, agent progress, pending decisions |
-| runner + PostgreSQL | Source of truth for workspaces, versions, executions, permissions |
-| Bucket | Full files as normal objects, addressed by content or version |
-| celld app (one cell/DO per workspace) | Orchestration of the in-flight execution, working cache; **nothing that cannot be rebuilt from Postgres + bucket** |
-| Dynamic Worker | Code for one execution, with bounded access to authorized inputs |
-
-Design rule: **celld orchestrates, Postgres remembers**. celld’s own durability keeps its
-internal state across restarts, but the runner does not depend on it to recover a task. That
-keeps the executor swappable (see decision summary, point 4).
+| runner + PostgreSQL | **Source of truth** for catalog, versions, executions, permissions |
+| App bucket | Full files as normal objects (identity-keyed); content hash in Postgres |
+| celld app (one cell/DO per workspace) | Orchestration of the in-flight execution, working cache; **nothing that cannot be rebuilt from Postgres + app bucket** |
+| Dynamic Worker | Code for one execution, with bounded access via capability grant |
 
 ### Initial deployment
 
-Normal pod, pinned image, unprivileged user, local writable directory, CPU/RAM limits, bucket
-access, **one replica**. The runner can live in the same pod or another; starting in the same
-one simplifies the pilot. Managed Postgres (runner-owned or a schema shared with the agent
-host: see §8).
+Normal pod, pinned image, unprivileged user, local writable directory, CPU/RAM limits, access to
+**both** the fleet bucket (celld) and the app bucket (runner), **one replica**. The runner can
+live in the same pod or another; starting in the same one simplifies the pilot. Managed Postgres
+(runner-owned or a schema shared with the agent host: see §8).
 
-## 5. Durable model: PostgreSQL + bucket
+## 5. Durable model: PostgreSQL + app bucket (logical VFS)
 
 Principles:
 
+- **Logical VFS = catalog**, not a filesystem layer. Path-like names
+  (`inputs/orders.csv`, `results/differences.csv`) map to immutable `dataset_versions` rows and
+  whole bucket objects. Phase 0 does **not** build a full FS; a stub facade over the catalog
+  contract is enough. Durable catalog implementation lands in phase 1.
 - One home for each fact: the **execution** lives in Postgres; its code, inputs (by version), and
-  outputs are referenced from there. Bytes live in the bucket.
+  outputs are referenced from there. Bytes live in the **application** bucket.
 - **An execution finishes when its outputs are in the bucket and its Postgres record is
-  confirmed**, in that order. Before that, for the agent it did not happen.
+  confirmed**, in that order. Before that, for the agent it did not happen. The **runner**
+  verifies objects (size / SHA-256) and publishes versions; the sandbox only stages bytes.
 - Flue retries reuse the `executionId`. Recording the result does not by itself prevent duplicate
-  external effects; destination operations (upload a file to another system) also need an
-  idempotency key. They are modeled as pending *effects* with an outbox, not as direct calls from
-  the Worker.
+  external effects; destination operations also need an idempotency key. They are modeled as
+  pending *effects* with an outbox, not as direct calls from the Worker.
 - Reproducibility: each execution stores code hash, exact input versions, runtime version
   (celld + image). True determinism also requires controlling time, randomness, and external
   responses; that remains a later improvement.
-- Mid-flight JS variables and half-executed functions are **not** preserved: celld rebuilds
-  objects after deactivation. What persists is files + metadata + confirmed results.
+- Mid-flight JS variables and half-executed functions are **not** preserved. Explicit persistence
+  contract (borrowed discipline from agentOS / CF Workspace patterns):
+
+  | Persists | Does not persist |
+  |---|---|
+  | Dataset versions, artifacts, execution records / summaries | In-flight JS locals, half-written streams |
+  | Catalog rows + app-bucket objects | celld DO cache, Facet scratch, `/tmp` |
+  | Committed effects outbox rows | Unconfirmed sandbox work |
+
+### What to copy vs avoid (Cloudflare / Rivet agentOS)
+
+| Copy | Avoid |
+|---|---|
+| Workspace / capability facade; execution separated from storage | SQLite-in-DO (or per-actor SQLite) as authoritative catalog |
+| Content hashes; metadata separate from bytes; lazy restore | Chunked block store (fixed-size S3 chunks + manifests) |
+| Explicit “what persists” table; path confinement on names | Full VM / POSIX root; credentials stored plaintext in the execution store |
+| Bytes bucket ↔ loader ↔ sandbox stream (never model / Postgres row) | Mounting fleet R2 for app data; Workflows / KV / D1 as SoR |
+
+### Cancel, reconcile, and attempt fencing
+
+The runner owns recovery:
+
+- Lease / heartbeat on `execution_attempts`; reconciler marks orphaned `running` rows when the
+  runner or celld is lost.
+- Monotonic fence: `active_attempt_no` (or equivalent); publish with
+  `UPDATE … WHERE status='running' AND active_attempt_no=$n`.
+- Artifact / blob keys are **per attempt** (or otherwise immutable per attempt) so a late fenced
+  attempt cannot overwrite published bytes. Only the runner finalizes and publishes.
+- `cancel` accepted ≠ compute stopped: measure Facet `abort()`, CPU accounting, and `/evict`.
+  Status may pass through `cancelling` until the attempt is fenced.
+
+Details and phase-0 checklist: [01-logical-vfs-and-runtime-gates.md](01-logical-vfs-and-runtime-gates.md).
 
 ## 6. Path: Flue now, Eve / Pi later
 
@@ -161,7 +229,7 @@ The agent host exposes tools backed by the runner SDK to the model. Design discu
 | Transfer images | Download and upload to allowed destinations, with size and type limits |
 
 Bytes do not pass through the model context: the model gets references and summaries.
-Credentials for external stores and internal services stay on the agent host.
+Credentials for external stores and internal services stay on the agent host (or loader `props`).
 
 The Flue adapter is thin: it maps tool calls to runner operations and propagates the stable task
 identity (`taskId` → `workspaceId`) and the `executionId` for idempotency. Flue does not change
@@ -181,8 +249,8 @@ Everything in TypeScript; agent-generated code is JavaScript.
 | Package (provisional name) | Responsibility |
 |---|---|
 | `runner-core` | Shared contracts (`Workspace`, `DatasetRef`, `ArtifactRef`, `ExecutionResult`) with runtime validation; execution state machine |
-| `runner-server` | Node service: HTTP API, Postgres, bucket, effects outbox, client toward celld |
-| `runner-celld` | App deployed on celld: Worker + DO per workspace + Dynamic Worker launch with capabilities |
+| `runner-server` | Node service: HTTP API, Postgres, app bucket, catalog, blob API, reconciler, effects outbox, authenticated client toward celld |
+| `runner-celld` | App deployed on celld: Worker + DO per workspace + Dynamic Worker launch with capability facade |
 | `runner-executor` | Small interface that abstracts “run code with inputs and capabilities”; `runner-celld` is the first implementation |
 | `runner-sdk` | TS client for Node (what the agent host consumes) |
 | `runner-flue` | Adapter: Flue tools → SDK |
@@ -193,33 +261,60 @@ Minimal runner operations (proposed in design, **not yet implemented or fully sp
 - `execute` — code, input refs, `executionId`.
 - `getExecution` — status or already-produced result.
 - `listArtifacts` / `readDataset` — materials of the authorized workspace.
-- `cancel` — actually stop the work.
+- `cancel` — mark cancelling, fence attempt, stop compute when possible.
+- `putDataset` — register an input from the host.
+- Idempotent *effects* for external transfers.
 
-Added as needs spotted in this design: `putDataset` (register an input from the host) and an
-idempotent *effects* mechanism for external transfers.
+Sandbox-facing facade (swappable with the executor), illustrative:
+
+```ts
+// env.WS is a capability stub; every method is an RPC into the loader Worker.
+await env.WS.read("inputs/orders.csv");                 // ReadableStream
+for await (const row of env.WS.rows("inputs/orders.csv")) { /* … */ }
+await env.WS.readRange("inputs/blob.bin", 0, 1 << 20);
+env.WS.write("results/differences.csv");                // WritableStream → multipart PUT
+await env.WS.list("inputs/");
+await env.WS.tool("lookup_account", { id });
+```
+
+Large inputs use ranged GET and row/byte streaming so work stays under the ~128 MB V8 heap.
+Idle HTTP streams expire after ~60 s in celld — phase-0 must prove a keep-alive / windowed
+read pattern.
 
 ## 8. Data schema (sketch)
 
 Names and columns are indicative; the real schema is defined in phase 1.
 
 ```text
-workspaces        id, owner (task/agent), created_at, status, policy (allowed capabilities)
-datasets          id, workspace_id, name, current_version_id
-dataset_versions  id, dataset_id, blob_key, size, content_hash, mime, created_by_execution_id?
-artifacts         id, workspace_id, execution_id, name, blob_key, size, content_hash, mime
-executions        id (client executionId), workspace_id, status, code_hash, code_blob_key,
-                  input_version_ids[], runtime_version, requested_at, finished_at, result_summary
-execution_attempts id, execution_id, attempt_no, executor, started_at, ended_at, outcome, error
-effects           id, execution_id, kind, idempotency_key, target, status, attempts, last_error
-permissions       workspace_id, principal, scope (read/write/tools)
+workspaces         id, owner (task/agent), created_at, status, policy (allowed capabilities)
+datasets           id, workspace_id, name (path-like, unique per workspace),
+                   current_version_id, created_at, deleted_at
+dataset_versions   id, dataset_id, version_no, blob_key, size, content_hash (sha256),
+                   mime, summary jsonb, produced_by_execution_id?, created_at   -- immutable
+artifacts          id, workspace_id, execution_id, attempt_no, name, blob_key, size,
+                   content_hash, mime, summary jsonb, promoted_to_version_id?
+executions         id (= client executionId), workspace_id, status, code_hash, code_blob_key,
+                   input_version_ids[], capability_grant jsonb, active_attempt_no,
+                   runtime_version, requested_at, finished_at, result_summary jsonb
+execution_attempts id, execution_id, attempt_no, executor, cell_epoch?, lease_expires_at,
+                   heartbeat_at, started_at, ended_at, outcome, error
+effects            id, execution_id, kind, idempotency_key, target, status, attempts, last_error
+permissions        workspace_id, principal, scope (read/write/tools)
 ```
 
-`executions` states: `pending → running → (succeeded | failed | cancelled)`. A repeated
-`execute` with the same `executionId` returns the current status without starting another run.
-`execution_attempts` separates runner retries from the logical execution.
+`executions` states: `pending → running → (succeeded | failed | cancelled)`, with `cancelling`
+while fence/stop is in progress. A repeated `execute` with the same `executionId` returns the
+current status without starting another run. `execution_attempts` separates runner retries from
+the logical execution.
 
-Blobs: full objects in the bucket, key derived from `workspace_id` + content hash. No proprietary
-fragmentation: the workspace rebuilds from Postgres + bucket alone.
+Blobs: **full objects** in the app bucket. Keys are **deterministic by identity**, e.g.
+`ws/<workspace_id>/exec/<executionId>/a/<attempt_no>/<artifact_name>` for staged artifacts and
+`ws/<workspace_id>/in/<dataset_version_id>` for host inputs — not content-hash-as-key.
+`content_hash` is stored in Postgres and verified on publish. No proprietary fragmentation: the
+workspace rebuilds from Postgres + app bucket alone.
+
+Summaries (`summary jsonb`) are computed at publish time by the runner (or a trusted server-side
+step), bounded in size — not trusted from agent code as authority.
 
 ## 9. Risks and open questions
 
@@ -228,12 +323,16 @@ fragmentation: the workspace rebuilds from Postgres + bucket alone.
 | Risk | Mitigation / test |
 |---|---|
 | celld alpha; patches only on latest version | Pin version, follow releases, swappable executor interface |
-| No `cpuMs`/`subRequests` limits on Dynamic Workers | Infinite-loop and memory tests; pod limits; isolate per replica if needed; measure impact on other executions |
-| Cancellation not effective | Explicit phase-0 test; if it fails, restart process/pod as last resort and document it |
+| `cpuMs`/`subRequests` may not be enforced despite v0.5.1 notes | Verify on binary; infinite-loop and memory tests; pod limits; isolate per replica if needed |
+| Cancellation not effective | Phase-0: Facet `abort`, stub drop, `/evict`; restart as last resort and document |
+| Stale attempt after runner/celld loss or cancel | Runner reconciler + lease/heartbeat + `active_attempt_no` fence; attempt-scoped keys |
 | Generated code influenced by external files | Minimal capabilities, `globalOutbound: null`, read-only gateway at first |
-| Pod loss mid-execution | “Bucket then Postgres” rule; `execution_attempts`; Flue and celld restart test |
+| Pod loss mid-execution | “Bucket then Postgres”; attempt fencing; Flue and celld restart test |
 | Duplicate external effects on retry | Outbox + destination idempotency key |
-| Bucket consistency requirements for celld | Verify against the real deployment bucket |
+| Fleet vs app bucket credential mix-up | Two-bucket topology; cross-deny tests; no fleet R2 for app bytes |
+| Unauthenticated operator listener | Private network only; no public ingress |
+| Bucket consistency requirements for celld | `celld diagnose` against the real fleet bucket |
+| Streaming idle expiry (~60 s) | Phase-0 large-object stream with CPU gaps; document windowed reads |
 | Workers ↔ celld compatibility gaps | Limit the surface used; test in the pod |
 
 ### Open questions
@@ -243,27 +342,35 @@ fragmentation: the workspace rebuilds from Postgres + bucket alone.
    simplifies permissions and joins with host permissions.
 3. How does `callTool` reach the host gateway from the Dynamic Worker: direct HTTP bridge with a
    per-execution token, or always through the runner? The second option centralizes audit.
-4. How much state to leave in the cell? Proposal: in-flight orchestration only. Is it worth the
-   cell keeping anything durable if Postgres already has it?
+4. How much state to leave in the cell? Proposal: in-flight orchestration only (confirmed).
 5. Multi-replica celld and workspace → replica affinity: out of MVP, but it constrains the API.
 6. Max dataset and artifact size per execution; version retention policy.
 7. What resume contract Eve and Pi require; not yet investigated.
 8. Comparison with QuickJS/Wasm and agentos-core as alternate executors: do it in phase 0 or
    defer until celld fails a test?
+9. Signed URLs in `props` vs loader-held app credentials for bucket access (preference: signed
+   URLs so celld never holds long-lived app keys).
 
 ## 10. Phased MVP
 
 Each phase ends with something runnable and a validating test.
 
-**Phase 0 — Technical feasibility (spike, no durability)**
+**Phase 0 — Technical feasibility (spike)**
 - celld in a normal pod with a custom image; a minimal app that launches a Dynamic Worker with a
   sample transform.
-- Tests: infinite loop, memory excess, unauthorized network access, cancellation.
-- Output: report on what was contained, what was not, and resource cost.
+- **No full FS layer.** Stub the capability facade (`read` / `write` / stream) against temporary
+  or fixture objects to prove the contract; durable catalog is phase 1.
+- Tests: infinite loop, memory excess / heap isolation, unauthorized network access, cancellation
+  (abort/evict), streaming large input within idle-stream limits, basic attempt fence against
+  late publish.
+- Recovery probes (lost runner response, pod delete mid-run) may use a **minimal** attempt record
+  even in the spike — “no durable product catalog” does not mean “no recovery experiment.”
+- Output: report on what was contained, what was not, resource cost, and verified v0.5.1 limits
+  behavior.
 
 **Phase 1 — Durable workspace + idempotent execution**
-- Postgres + bucket with the §8 schema; `execute`, `getExecution`, `cancel`, `listArtifacts`,
-  `readDataset`, `putDataset`.
+- Postgres + app bucket with the §8 schema (catalog = logical VFS); `execute`, `getExecution`,
+  `cancel`, `listArtifacts`, `readDataset`, `putDataset`; reconciler + attempt fence.
 - Primary design test: load a spreadsheet, normalize identifiers, join with another table, save
   `differences.csv`, **restart Flue and celld**, continue the same task with the same data
   version, without losing files or repeating effects.
@@ -280,6 +387,6 @@ Each phase ends with something runnable and a validating test.
 **Phase 4 — Second agent core**
 - Eve or Pi adapter on the same SDK; validate that the API did not leak Flue concepts.
 
-Production decision criterion: recovery after pod loss, real cancellation, and containment of
-resource use when running generated JS. If phase 0 fails on cancellation or containment, reopen
-the executor comparison before phase 1.
+Production decision criterion: recovery after pod loss, real cancellation, attempt fencing, and
+containment of resource use when running generated JS. If phase 0 fails on cancellation or
+containment, reopen the executor comparison before phase 1.
